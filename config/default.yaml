@@ -1,0 +1,6 @@
+api_url: ""
+api_key: ""
+
+model_name: "gpt-4o-0513"
+output_dir: "./outputs"
+run_name: "run"
