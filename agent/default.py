@@ -10,6 +10,7 @@ from tools.planning_tool import PlanningTool
 from tools.base_tools import BaseTools
 from tools.env_management import EnvManagementTool
 from traj import TraceTrack
+from agent.context_manager import ContextManagerAgent
 
 logger = logging.getLogger(name=__name__)
 agent_console = Console()
@@ -18,7 +19,7 @@ class DefaultAgent:
     """
     This is the code agent.
     """
-    def __init__(self, config, agent_name: str, item_id: str, context_manager=None) -> None:
+    def __init__(self, config, item_id: str, work_root: str = None, agent_name: str = "default") -> None:
         self.config = config
         self.max_turns = self.config.max_turns
         self.api_key = self.config.api_key
@@ -27,10 +28,18 @@ class DefaultAgent:
         self.client = OpenAI(api_key=self.api_key, base_url=self.api_url)
         self.model = self.config.model_name
         self.item_id = item_id
+        self.work_root = work_root
         self.trace_track = TraceTrack(root_dir=self.config.output_dir, agent_name=agent_name, item_id=item_id)
 
-        # Reference to context manager (optional)
-        self.context_manager = context_manager
+        # Initialize session state
+        self.session_initialized = False
+        self.initialization_attempted = False
+
+        # Test retry limitation to prevent infinite loops
+        self.test_attempt_count = 0
+        self.max_test_attempts = 5  # Maximum number of test retry attempts
+        self.consecutive_test_failures = 0
+        self.max_consecutive_failures = 3  # Stop if tests fail 3 times in a row
 
         # Initialize tool registry with all available tools
         self.tool_registry = ToolRegistry()
@@ -38,62 +47,124 @@ class DefaultAgent:
         # Register all tools with same item_id
         self.tool_registry.register_tool(FileSystemTool(item_id=item_id))
         self.tool_registry.register_tool(WindowedEditorTool(item_id=item_id))
-        self.tool_registry.register_tool(PlanningTool(item_id=item_id))
-        self.tool_registry.register_tool(BaseTools(item_id=item_id))
-        self.tool_registry.register_tool(EnvManagementTool(item_id=item_id))
+
+        # Initialize BaseTools with work_root
+        self.base_tools = BaseTools(item_id=item_id, work_root=work_root)
+        self.tool_registry.register_tool(self.base_tools)
+
+        # Register EnvManagementTool with work_root provider
+        self.tool_registry.register_tool(EnvManagementTool(
+            item_id=item_id,
+            work_root_provider=lambda: self.work_root
+        ))
+
+        # Initialize Context Manager Agent for state and memory management
+        self.context_manager = ContextManagerAgent(
+            config=config,
+            item_id=item_id,
+            default_agent_name=agent_name
+        )
+
+        # Smart initialization state detection - check if we're already in a prepared environment
+        self._detect_and_set_initial_state()
 
         agent_console.print("✅ All Tools registered\n", style="green")
         agent_console.print(self.tool_registry.get_registry_summary())
 
-        # Track initialization state at agent level
-        self.session_initialized = False
-        self.initialization_attempted = False
+        # Simplified system message focused on core functionality
+        work_root_info = f"Working Directory: {self.work_root or 'Not specified'}"
 
-        # Enhanced state awareness
-        self._last_context_check = None
+        self.system_message = f"""You are SafeFlow, an intelligent code analysis and repair agent.
 
-        self.system_message = (
-            "You are SafeFlow, an intelligent agent for coding and task management.\n\n"
-            "CORE PRINCIPLES:\n"
-            "- ALWAYS check your current work context before starting operations\n"
-            "- Use absolute file paths for all operations\n"
-            "- Be systematic and thorough in your approach\n"
-            "- Use appropriate tools for each type of operation\n"
-            "- Maintain awareness of your initialization status and work location\n"
-            "- Verify task completion before calling base_tools__finish_task()\n\n"
-            "## Available Tools (Clear Boundaries)\n"
-            "- **base_tools**: ONLY initialization, workspace setup, git clone, task finish\n"
-            "- **windowed_editor**: ONLY file editing with precise line-number control + file info\n"
-            "- **file_system**: ONLY file discovery, glob search, semantic search, symbol search (AST)\n"
-            "- **env_management**: ONLY bash commands, compilation, quality checks, testing\n"
-            "- **planning_tool**: ONLY task planning, progress tracking, plan management\n\n"
-            "## Initialization Flow\n"
-            "1. Check status: `base_tools__session_state(action='check')`\n"
-            "2. If needed: `base_tools__complete_initialization()` (ONCE only)\n"
-            "3. Always work relative to your established work_root\n\n"
+## Current Context
+{work_root_info}
 
-            "## Tool Usage Guidelines\n"
-            "- **CRITICAL: Use ABSOLUTE paths**: All tools require absolute paths except base_tools__set_work_root\n"
-            "- **Get work_root**: Use base_tools__session_state(action='get_context') to get your work_root\n"
-            "- **Build absolute paths**: Combine work_root + filename (e.g., '/path/to/work/file.py')\n"
-            "- **File editing**: windowed_editor for precise line-based changes (absolute paths only)\n"
-            "- **File discovery**: file_system for finding and analyzing files (absolute paths only)\n"
-            "- **Code verification**: env_management for bash, compilation, testing (absolute working_dir)\n"
-            "- **Planning**: planning_tool for task management (absolute plan file paths only)\n\n"
+## Available Tools
+- **file_system**: Find, search, and analyze code files
+- **windowed_editor**: Edit files with precise line control
+- **env_management**: Run tests, execute commands, check code quality
+- **base_tools**: Basic operations (git status, test running, task completion)
 
-            "## 🔥 Code Verification Protocol\n"
-            "**Before presenting code to users, ALWAYS:**\n"
-            "1. **Syntax**: `env_management__execute_bash('python -m py_compile file.py')`\n"
-            "2. **Quality** (if available): `env_management__code_quality_check('flake8', '.')`\n"
-            "3. **Fix & Re-test**: Iterate until everything works correctly\n\n"
-            # "4. **Execute**: `env_management__execute_bash('python file.py')` - verify it runs!\n"
+## Your Process
+1. **Understand**: Read the problem description carefully
+2. **Explore**: Use file_system tools to find relevant code
+3. **Analyze**: Understand the current behavior and root cause
+4. **Fix**: Make targeted changes using windowed_editor
+5. **Verify**: Run tests to confirm your fix works
+6. **Complete**: Use base_tools__finish_task when done
 
+## Guidelines
+- Always use absolute paths: {self.work_root or '/path/to/work'}/filename
+- Make minimal, targeted changes
+- Test your changes frequently
+- Focus on the specific issue described
 
-            "## Communication Rules\n"
-            "- **NEVER empty content**: Always explain your actions in the content field\n"
-            "- **Tool rationale**: Describe what each tool call will accomplish\n"
-            "- **Systematic approach**: Complete verification before marking tasks done\n"
-        )
+## Testing Guidelines
+- Use env_management__execute_bash to run tests
+- Verify both that failing tests now pass AND existing tests still work
+- Run `python -m pytest test_path -v` for detailed test output
+- **IMPORTANT**: If tests fail repeatedly (3+ times), consider generating a patch instead of retrying
+- Focus on creating a working solution rather than achieving 100% test pass rate
+
+## Completion Options
+1. **Generate Patch (Recommended for SWE tasks)**: Use `base_tools__generate_patch()` to create a patch file with your changes
+2. **Direct Completion**: Use `base_tools__finish_task()` for regular tasks
+
+Start by understanding the problem and exploring the codebase."""
+
+    def _detect_and_set_initial_state(self) -> None:
+        """
+        Detect if we're already in a prepared environment and set initialization state accordingly.
+        This prevents redundant initialization when swe_run.py or other scripts have already prepared the environment.
+        """
+        try:
+            from pathlib import Path
+
+            # Check if work_root is already set and points to a valid directory
+            if self.work_root:
+                work_path = Path(self.work_root)
+                if work_path.exists() and work_path.is_dir():
+                    # Check if it's a git repository (strong indicator of prepared environment)
+                    git_dir = work_path / ".git"
+                    if git_dir.exists():
+                        # We're in a prepared repository environment
+                        self.session_initialized = True
+                        self.initialization_attempted = True  # Prevent initialization prompts
+
+                        # Mark base_tools as initialized too
+                        if self.base_tools:
+                            self.base_tools._mark_session_initialized(str(work_path))
+
+                        agent_console.print(f"🎯 Detected prepared repository environment at: {work_path}", style="cyan")
+                        return
+
+                    # Check if it contains typical project files (another indicator)
+                    project_indicators = [".git", "pyproject.toml", "setup.py", "package.json", "Makefile", "README.md"]
+                    found_indicators = [f for f in project_indicators if (work_path / f).exists()]
+
+                    if len(found_indicators) >= 2:  # Multiple project files suggest prepared environment
+                        self.session_initialized = True
+                        self.initialization_attempted = True
+
+                        # Mark base_tools as initialized
+                        if self.base_tools:
+                            self.base_tools._mark_session_initialized(str(work_path))
+
+                        agent_console.print(f"🎯 Detected prepared project environment at: {work_path} (found: {found_indicators})", style="cyan")
+                        return
+
+            # Check base_tools session state as fallback
+            if self.base_tools and hasattr(self.base_tools, '_is_session_initialized'):
+                if self.base_tools._is_session_initialized():
+                    self.session_initialized = True
+                    self.initialization_attempted = True
+                    agent_console.print("🎯 Detected existing session initialization", style="cyan")
+                    return
+
+            agent_console.print("🔧 No prepared environment detected, initialization will be required", style="yellow")
+        except Exception as e:
+            # If detection fails, err on the side of requiring initialization
+            agent_console.print(f"⚠️ Environment detection failed: {e}, will require initialization", style="yellow")
 
     def get_current_work_context(self) -> Dict[str, Any]:
         """Get current work context from context manager."""
@@ -140,6 +211,20 @@ class DefaultAgent:
                 result = tool_result.get("result", {})
                 work_root = result.get("work_root")
                 task_analysis = result.get("task_analysis", {})
+
+                self.context_manager.update_work_context(
+                    work_root=work_root,
+                    initialization_status="completed"
+                )
+
+                # Track completed steps
+                for step in result.get("steps_completed", []):
+                    self.context_manager.add_completed_step(step)
+
+            # Also handle other initialization functions that complete initialization
+            elif "initialization_completed" in tool_result.get("result", {}):
+                result = tool_result.get("result", {})
+                work_root = result.get("work_root")
 
                 self.context_manager.update_work_context(
                     work_root=work_root,
@@ -306,7 +391,7 @@ class DefaultAgent:
         enhanced_prompt = self._enhance_user_prompt_with_initialization(user_prompt)
         push({"role": "user", "content": enhanced_prompt})
 
-        # 如果你仍想额外记录调试信息，可以用 save_json，而不是 step
+        # 保存工具schema到outputs目录便于调试和分析
         trace_track.save_json(f"{self.agent_name}_tools_schema.json", tools_schema)
 
         for turn in range(1, self.max_turns + 1):
@@ -318,6 +403,12 @@ class DefaultAgent:
                     # Add reminder message to conversation
                     reminder_msg = {"role": "system", "content": reminder_data["message"]}
                     push(reminder_msg)
+
+                # Add working directory reminder each turn (only after initialization)
+                if self.context_manager and self.context_manager.should_remind_work_dir():
+                    work_dir_reminder = self.context_manager.get_working_directory_reminder()
+                    work_dir_msg = {"role": "system", "content": work_dir_reminder}
+                    push(work_dir_msg)
 
             # Use context_manager's memory management to get appropriately sized messages
             # This ensures we don't exceed token limits while preserving important context
@@ -348,7 +439,15 @@ class DefaultAgent:
             tool_calls = getattr(msg, "tool_calls", None) or []
             # assistant message（带 tool_calls 时 content 可能为 None，这没问题）
             assistant_entry: Dict[str, Any] = {"role": "assistant", "content": content}
-            agent_console.print(f"Agent in Turn {turn}: {content}", style="green")
+
+            # 美化输出显示
+            if content:
+                agent_console.print(f"[bold green]Agent Turn {turn}[/bold green]: {content}")
+            elif tool_calls:
+                tool_names = [tc.function.name for tc in tool_calls]
+                agent_console.print(f"[bold green]Agent Turn {turn}[/bold green]: [cyan]Using tools[/cyan]: {', '.join(tool_names)}")
+            else:
+                agent_console.print(f"[bold green]Agent Turn {turn}[/bold green]: [yellow]No response content[/yellow]")
 
             if tool_calls:
                 assistant_entry["tool_calls"] = [
@@ -404,6 +503,9 @@ class DefaultAgent:
                 # Monitor initialization completion
                 self._check_initialization_completion(function_name, tool_result)
 
+                # Monitor test attempts to prevent infinite loops
+                self._monitor_test_attempts(function_name, tool_result)
+
                 # Update context after tool call
                 self.update_context_after_tool_call(tool_name, function_name, tool_result, args)
 
@@ -422,3 +524,54 @@ class DefaultAgent:
             "error": f"Reached max_turns={self.max_turns} without finish_task or final response.",
             "messages": messages,
         }
+
+    def _monitor_test_attempts(self, function_name: str, tool_result: Dict[str, Any]) -> None:
+        """
+        Monitor test attempts to prevent infinite testing loops.
+        """
+        # Check if this is a test-related function
+        test_functions = [
+            "env_management__execute_bash",  # Running pytest directly
+            "env_management__run_pytest_smart",  # Smart pytest runner
+        ]
+
+        # Check if the bash command looks like a test command
+        is_test_command = False
+        if function_name == "env_management__execute_bash":
+            # Check if result contains test-related keywords
+            result_str = str(tool_result).lower()
+            if any(keyword in result_str for keyword in ["pytest", "test_", "test/", "tests/"]):
+                is_test_command = True
+        elif function_name in test_functions:
+            is_test_command = True
+
+        if is_test_command:
+            self.test_attempt_count += 1
+
+            # Check if test failed
+            test_success = tool_result.get("success", False)
+            if not test_success:
+                self.consecutive_test_failures += 1
+            else:
+                self.consecutive_test_failures = 0  # Reset on success
+
+            # Log warning if approaching limits
+            if self.test_attempt_count >= self.max_test_attempts - 1:
+                agent_console.print(
+                    f"⚠️ [yellow]Warning[/yellow]: Test attempt {self.test_attempt_count}/{self.max_test_attempts}. "
+                    "Consider generating a patch if tests keep failing.",
+                    style="yellow"
+                )
+            elif self.consecutive_test_failures >= self.max_consecutive_failures - 1:
+                agent_console.print(
+                    f"⚠️ [yellow]Warning[/yellow]: {self.consecutive_test_failures} consecutive test failures. "
+                    "Consider alternative approach or generate patch.",
+                    style="yellow"
+                )
+
+            # Record in context manager if available
+            if self.context_manager:
+                self.context_manager.record_memory(
+                    "test_attempt",
+                    f"Test attempt {self.test_attempt_count}: {function_name} - {'Success' if test_success else 'Failed'}"
+                )

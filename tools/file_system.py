@@ -19,19 +19,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Tuple
 from tools.abs_tools import Tool, ToolCategory, ToolParameter, tool_function
 
-# Try to import libraries for semantic search
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-
-try:
-    import numpy as np
-    from sklearn.metrics.pairwise import cosine_similarity
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
+# Semantic search has been disabled due to dependency issues
+# Use text-based search instead for reliable functionality
+SENTENCE_TRANSFORMERS_AVAILABLE = False
+NUMPY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +56,7 @@ class FileSystemTool(Tool):
         self.item_id = item_id
         self.read_only = read_only
 
-        # Initialize semantic search model (lazy loading)
-        self._semantic_model = None
+        # Semantic search disabled - use text search instead
         self._code_cache = {}  # Cache for parsed code structures
 
     def _validate_absolute_path(self, path: str) -> Path:
@@ -80,15 +70,8 @@ class FileSystemTool(Tool):
             raise ValueError(f"Invalid path '{path}': {e}")
 
     def _get_semantic_model(self):
-        """Lazy load semantic model for code search."""
-        if self._semantic_model is None and SENTENCE_TRANSFORMERS_AVAILABLE:
-            try:
-                # Use a model optimized for code/text similarity
-                self._semantic_model = SentenceTransformer('all-MiniLM-L6-v2')  # Lightweight and effective
-            except Exception as e:
-                logger.warning(f"Failed to load semantic model: {e}")
-                self._semantic_model = False
-        return self._semantic_model
+        """Semantic search disabled - always return False to use text search."""
+        return False
 
     def _extract_code_elements(self, file_path: Path) -> List[Dict[str, Any]]:
         """Extract functions, classes, and important code elements from Python files."""
@@ -324,15 +307,15 @@ class FileSystemTool(Tool):
             return {"success": False, "error": f"Path check failed: {e}"}
 
     @tool_function(
-        description="Semantic search for code elements (functions, classes) using natural language queries. Like Cursor's code search.",
+        description="Text-based search for code elements (functions, classes). Uses keyword matching instead of semantic embeddings.",
         parameters=[
             ToolParameter("root_path", "string", "Absolute path to search from", required=True),
-            ToolParameter("query", "string", "Natural language query (e.g., 'functions that handle user authentication')", required=True),
+            ToolParameter("query", "string", "Search query with keywords (e.g., 'authentication function login')", required=True),
             ToolParameter("file_pattern", "string", "Glob pattern for files to search (default: '**/*.py')", required=False, default="**/*.py"),
             ToolParameter("max_results", "integer", "Maximum number of results", required=False, default=10),
             ToolParameter("include_preview", "boolean", "Include code preview in results", required=False, default=True),
         ],
-        returns="Semantically relevant code elements with similarity scores",
+        returns="Text-matched code elements with relevance scores",
         category=ToolCategory.FILE_SYSTEM,
     )
     def file_system__semantic_search(
@@ -343,82 +326,15 @@ class FileSystemTool(Tool):
         max_results: int = 10,
         include_preview: bool = True
     ) -> Dict[str, Any]:
-        """Search for code elements using semantic similarity."""
+        """Search for code elements using text-based matching."""
         try:
             root = self._validate_absolute_path(root_path)
 
             if not root.exists():
                 return {"success": False, "error": f"Root directory not found: {root}"}
 
-            # Check if semantic search is available
-            model = self._get_semantic_model()
-            if not model or not NUMPY_AVAILABLE:
-                # Fall back to text-based search
-                return self._fallback_text_search(root, query, file_pattern, max_results, include_preview)
-
-            # Collect all code elements
-            all_elements = []
-            for file_path in root.rglob(file_pattern):
-                if file_path.is_file() and file_path.stat().st_size < 1024 * 1024:  # Skip files > 1MB
-                    elements = self._extract_code_elements(file_path)
-                    all_elements.extend(elements)
-
-            if not all_elements:
-                return {"success": True, "result": {"matches": [], "query": query, "total_searched": 0}}
-
-            # Create search texts for embedding
-            search_texts = []
-            for element in all_elements:
-                # Combine name, signature, docstring for better matching
-                search_text = f"{element['name']} {element['signature']} {element['docstring']}"
-                search_texts.append(search_text)
-
-            try:
-                # Generate embeddings for all code elements
-                code_embeddings = model.encode(search_texts)
-
-                # Generate embedding for the query
-                query_embedding = model.encode([query])
-
-                # Calculate similarities
-                similarities = cosine_similarity(query_embedding, code_embeddings)[0]
-
-                # Sort by similarity and get top results
-                scored_results = list(zip(all_elements, similarities))
-                scored_results.sort(key=lambda x: x[1], reverse=True)
-
-                # Format results
-                matches = []
-                for element, score in scored_results[:max_results]:
-                    if score > 0.1:  # Only include reasonably similar results
-                        result = {
-                            "type": element["type"],
-                            "name": element["name"],
-                            "file_path": element["file_path"],
-                            "line": element["line"],
-                            "signature": element["signature"],
-                            "similarity_score": float(score),
-                            "docstring": element["docstring"][:200] + "..." if len(element["docstring"]) > 200 else element["docstring"]
-                        }
-
-                        if include_preview:
-                            result["code_preview"] = element["content_preview"]
-
-                        matches.append(result)
-
-                return {
-                    "success": True,
-                    "result": {
-                        "matches": matches,
-                        "query": query,
-                        "total_searched": len(all_elements),
-                        "search_method": "semantic_embedding"
-                    }
-                }
-
-            except Exception as e:
-                logger.warning(f"Embedding search failed: {e}, falling back to text search")
-                return self._fallback_text_search(root, query, file_pattern, max_results, include_preview)
+            # Use text-based search directly (semantic search disabled)
+            return self._fallback_text_search(root, query, file_pattern, max_results, include_preview)
 
         except Exception as e:
             return {"success": False, "error": f"Semantic search failed: {e}"}

@@ -574,8 +574,14 @@ class ContextManagerAgent:
     def update_work_context(self, work_root: str = None, task_description: str = None,
                            initialization_status: str = None) -> None:
         """Update work context with new information."""
+        old_work_root = self.current_state.get("work_root")
+
         if work_root:
             self.current_state["work_root"] = work_root
+            # Log work directory change
+            if old_work_root != work_root:
+                context_console.print(f"📁 Work directory changed: {old_work_root} → {work_root}", style="cyan")
+
         if task_description:
             self.current_state["current_task"] = task_description
         if initialization_status:
@@ -671,3 +677,19 @@ class ContextManagerAgent:
             "turn_count": self.turn_count,
             "message": f"CURRENT WORK CONTEXT: {context_summary}"
         }
+
+    def get_working_directory_reminder(self) -> str:
+        """Get current working directory reminder for each turn."""
+        work_root = self.current_state.get('work_root')
+        if work_root:
+            return f"Now, we are working in directory: {work_root}"
+        else:
+            return "Working directory not yet set. Initialize workspace first."
+
+    def should_remind_work_dir(self) -> bool:
+        """Check if we should remind about working directory each turn."""
+        # Only remind if we actually have a work_root set and initialization is completed
+        return (
+            self.current_state.get('work_root') is not None and
+            self.current_state.get('initialization_status') == 'completed'
+        )

@@ -3,4 +3,6 @@ api_key: ""
 
 model_name: "gpt-4o-0513"
 output_dir: "./outputs"
-max_turns: 100
+max_turns: 1000000
+
+parquet_path: "/home/yunhao.fyh/project/Safeflow/data/Swe-bench_Verified/data/test-00000-of-00001.parquet"

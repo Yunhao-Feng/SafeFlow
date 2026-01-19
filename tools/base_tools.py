@@ -1,8 +1,10 @@
+import json
 import os
 import re
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -145,8 +147,9 @@ class BaseTools(Tool):
     def __init__(
         self,
         item_id: str,
+        work_root: Optional[str] = None,
         name: str = "base_tools",
-        description: str = "Initialization/workspace/git orchestration tools",
+        description: str = "Basic task management tools",
         command_timeout_sec: int = 300,
         max_cmd_output_chars: int = 200_000,
     ):
@@ -155,8 +158,9 @@ class BaseTools(Tool):
         self.command_timeout_sec = command_timeout_sec
         self.max_cmd_output_chars = max_cmd_output_chars
 
+        # Set work_root directly if provided
+        self.work_root = Path(work_root).resolve() if work_root else Path.cwd().resolve()
         self._task_blob_preview: Optional[str] = None
-        self.work_root: Optional[Path] = None
 
     def _is_session_initialized(self) -> bool:
         """Check if current session (item_id) is already initialized."""
@@ -171,7 +175,63 @@ class BaseTools(Tool):
     def _get_session_work_root(self) -> Optional[str]:
         """Get work root for current session if exists."""
         return self._session_work_roots.get(self.item_id)
-    
+
+    def get_current_work_root(self) -> Optional[Path]:
+        """Get current work root as Path object for external access."""
+        return self.work_root
+
+    def get_current_work_root_str(self) -> Optional[str]:
+        """Get current work root as string for external access."""
+        return str(self.work_root) if self.work_root else None
+
+    @tool_function(
+        description="Mark the current task as completed",
+        parameters=[
+            ToolParameter("message", "string", "Completion message describing what was accomplished", required=True),
+            ToolParameter("success", "boolean", "Whether the task was completed successfully", required=False)
+        ],
+        returns="Task completion status and details"
+    )
+    def finish_task(self, message: str, success: bool = True) -> Dict[str, Any]:
+        """Mark the current task as completed."""
+        try:
+            return {
+                "success": True,
+                "result": {
+                    "task_completed": True,
+                    "completion_success": success,
+                    "message": message,
+                    "work_root": str(self.work_root),
+                    "item_id": self.item_id
+                }
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    @tool_function(
+        description="Get the current working directory/root",
+        parameters=[],
+        returns="Current work root information"
+    )
+    def get_work_root(self) -> Dict[str, Any]:
+        """Get the current working directory."""
+        try:
+            return {
+                "success": True,
+                "result": {
+                    "work_root": str(self.work_root),
+                    "exists": self.work_root.exists(),
+                    "is_directory": self.work_root.is_dir()
+                }
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
 
     def base_tools__initialize_context(
         self,
@@ -314,8 +374,53 @@ class BaseTools(Tool):
         host = m.group(1).lower()
 
         dest = _ensure_under(self.work_root, (self.work_root / (dest_subdir or "repo")))
+
+        # Smart detection: if destination exists and is already the correct repository, just use it
         if dest.exists() and any(dest.iterdir()):
+            git_dir = dest / ".git"
+            if git_dir.exists():
+                # Check if it's the correct repository by comparing remote URL
+                try:
+                    result = subprocess.run(
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=str(dest),
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    if result.returncode == 0:
+                        existing_url = result.stdout.strip()
+                        # Normalize URLs for comparison
+                        if existing_url.replace('.git', '').replace('https://', '').replace('http://', '') == \
+                           repo_url.replace('.git', '').replace('https://', '').replace('http://', ''):
+                            # Same repository, just return success
+                            cp3, _, _ = subprocess.run(
+                                ["git", "rev-parse", "HEAD"],
+                                cwd=str(dest),
+                                capture_output=True,
+                                text=True,
+                                timeout=10
+                            ), "", ""
+                            head = cp3.stdout.strip() if cp3.returncode == 0 else None
+
+                            return {
+                                "success": True,
+                                "result": {
+                                    "repo_url": repo_url,
+                                    "dest": str(dest),
+                                    "head": head,
+                                    "checked_out": checkout or None,
+                                    "message": "Repository already exists at destination",
+                                    "stdout": f"Using existing repository at {dest}",
+                                    "stderr": "",
+                                },
+                            }
+                except Exception:
+                    pass
+
+            # Different repository or not a git repo, fail
             return {"success": False, "error": f"Destination not empty: {dest}"}
+
         dest.mkdir(parents=True, exist_ok=True)
 
         cmd = ["git", "clone"]
@@ -549,7 +654,7 @@ class BaseTools(Tool):
         task_blob: str,
         force_reinit: bool = False
     ) -> Dict[str, Any]:
-        """Execute complete initialization workflow."""
+        """Execute complete initialization workflow with smart environment detection."""
         try:
             # Step 1: Check if already initialized
             if self._is_session_initialized() and not force_reinit:
@@ -563,14 +668,41 @@ class BaseTools(Tool):
                     }
                 }
 
-            # Step 2: Initialize context (explore current directory)
+            # Step 2: Smart environment detection - check if we're already in a prepared environment
+            # If work_root is already set and points to a valid git repository, don't recreate
+            if self.work_root and self.work_root.exists():
+                # Check if it's already a git repository
+                git_dir = self.work_root / ".git"
+                if git_dir.exists():
+                    # We're already in a prepared repository, just use it
+                    self._mark_session_initialized(str(self.work_root))
+
+                    # Still do workspace summary for awareness
+                    summary_result = self.base_tools__summarize_work_root()
+                    workspace_summary = {}
+                    if summary_result["success"]:
+                        workspace_summary = summary_result["result"]["summaries"]
+
+                    return {
+                        "success": True,
+                        "result": {
+                            "initialization_completed": True,
+                            "work_root": str(self.work_root),
+                            "workspace_strategy": "use_existing_prepared_repo",
+                            "workspace_summary": workspace_summary,
+                            "message": "Using existing prepared repository environment",
+                            "steps_completed": ["existing_environment_detected", "workspace_summary"]
+                        }
+                    }
+
+            # Step 3: Initialize context (explore current directory)
             context_result = self.base_tools__initialize_context(task_blob)
             if not context_result["success"]:
                 return {"success": False, "error": f"Context initialization failed: {context_result['error']}"}
 
             cwd_info = context_result["result"]
 
-            # Step 3: Analyze task type and get workspace recommendation
+            # Step 4: Analyze task type and get workspace recommendation
             analysis_result = self.base_tools__analyze_task_type(task_blob)
             if not analysis_result["success"]:
                 return {"success": False, "error": f"Task analysis failed: {analysis_result['error']}"}
@@ -578,37 +710,60 @@ class BaseTools(Tool):
             analysis = analysis_result["result"]
             recommendation = analysis["recommendation"]
 
-            # Step 4: Set work root based on recommendation
-            work_root_result = self.base_tools__set_work_root(
-                path=recommendation["work_root"],
-                create=True
-            )
-            if not work_root_result["success"]:
-                return {"success": False, "error": f"Work root setup failed: {work_root_result['error']}"}
+            # Step 5: Set work root based on recommendation (only if not already set appropriately)
+            if not self.work_root or not self.work_root.exists():
+                work_root_result = self.base_tools__set_work_root(
+                    path=recommendation["work_root"],
+                    create=True
+                )
+                if not work_root_result["success"]:
+                    return {"success": False, "error": f"Work root setup failed: {work_root_result['error']}"}
+                work_root = work_root_result["result"]["work_root"]
+            else:
+                work_root = str(self.work_root)
 
-            work_root = work_root_result["result"]["work_root"]
-
-            # Step 5: Clone repository if needed (SWE tasks)
+            # Step 6: Clone repository only if needed and destination doesn't already exist
             clone_result = None
             if recommendation.get("requires_clone") and recommendation.get("repo_info", {}).get("repo"):
                 repo_info = recommendation["repo_info"]
 
-                # Determine destination subdirectory
-                if recommendation["strategy"] == "clone_to_cwd":
-                    dest_subdir = "."
+                # Check if repository already exists in the target location
+                repo_name = repo_info["repo"].split("/")[-1]
+                potential_repo_path = self.work_root / repo_name
+
+                if potential_repo_path.exists() and (potential_repo_path / ".git").exists():
+                    # Repository already exists, don't clone again
+                    clone_result = {
+                        "result": {
+                            "dest": str(potential_repo_path),
+                            "message": "Repository already exists, skipped cloning"
+                        }
+                    }
+                    # Update work_root to the existing repository
+                    self.work_root = potential_repo_path.resolve()
+                    work_root = str(self.work_root)
                 else:
-                    dest_subdir = "repo"
+                    # Determine destination subdirectory
+                    if recommendation["strategy"] == "clone_to_cwd":
+                        dest_subdir = "."
+                    else:
+                        dest_subdir = "repo"
 
-                clone_result = self.base_tools__git_clone(
-                    repo=repo_info["repo"],
-                    dest_subdir=dest_subdir,
-                    checkout=repo_info.get("base_commit", "")
-                )
+                    clone_result = self.base_tools__git_clone(
+                        repo=repo_info["repo"],
+                        dest_subdir=dest_subdir,
+                        checkout=repo_info.get("base_commit", "")
+                    )
 
-                if not clone_result["success"]:
-                    return {"success": False, "error": f"Git clone failed: {clone_result['error']}"}
+                    if not clone_result["success"]:
+                        return {"success": False, "error": f"Git clone failed: {clone_result['error']}"}
 
-            # Step 6: Summarize workspace (especially important after cloning)
+                    # Update work_root to the cloned repository directory
+                    cloned_repo_path = clone_result["result"]["dest"]
+                    self.work_root = Path(cloned_repo_path).resolve()
+                    work_root = str(self.work_root)
+
+            # Step 7: Summarize workspace
             summary_result = self.base_tools__summarize_work_root()
             workspace_summary = {}
             if summary_result["success"]:
@@ -631,11 +786,14 @@ class BaseTools(Tool):
 
             if clone_result:
                 result["git_clone"] = clone_result["result"]
-                result["steps_completed"].append("repository_clone")
+                if "skipped" not in clone_result["result"].get("message", ""):
+                    result["steps_completed"].append("repository_clone")
+                else:
+                    result["steps_completed"].append("existing_repository_detected")
 
             result["steps_completed"].append("workspace_summary")
 
-            # Explicitly mark session as initialized after all steps complete
+            # Mark session as initialized
             self._mark_session_initialized(work_root)
 
             return {
@@ -834,6 +992,64 @@ class BaseTools(Tool):
         except Exception as e:
             return {"success": False, "error": f"Environment verification failed: {e}"}
 
+    def _detect_swe_task(self) -> bool:
+        """检测当前是否为SWE任务"""
+        try:
+            # 检查是否有task_blob_preview (从初始化过程中保存)
+            if hasattr(self, '_task_blob_preview') and self._task_blob_preview:
+                task_blob_str = self._task_blob_preview
+            else:
+                # 尝试从context文件读取
+                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
+                if context_file.exists():
+                    with open(context_file, 'r') as f:
+                        context_data = json.load(f)
+                        task_blob_str = context_data.get('task_blob', '')
+                else:
+                    return False
+
+            # 检测SWE特有指标
+            swe_indicators = [
+                'FAIL_TO_PASS', 'PASS_TO_PASS', 'instance_id',
+                'base_commit', 'test_patch', 'problem_statement'
+            ]
+
+            return any(indicator in task_blob_str for indicator in swe_indicators)
+        except Exception:
+            return False
+
+    def _extract_swe_test_info(self) -> tuple:
+        """从任务信息中提取FAIL_TO_PASS和PASS_TO_PASS测试列表"""
+        try:
+            # 获取完整的task_blob
+            task_blob_str = ""
+            if hasattr(self, '_task_blob_preview') and self._task_blob_preview:
+                task_blob_str = self._task_blob_preview
+            else:
+                # 尝试从context文件读取
+                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
+                if context_file.exists():
+                    with open(context_file, 'r') as f:
+                        context_data = json.load(f)
+                        task_blob_str = context_data.get('task_blob', '')
+
+            if not task_blob_str:
+                return [], []
+
+            # 解析为JSON
+            task_data = json.loads(task_blob_str)
+
+            # 解析测试列表
+            fail_to_pass_str = task_data.get('FAIL_TO_PASS', '[]')
+            pass_to_pass_str = task_data.get('PASS_TO_PASS', '[]')
+
+            fail_to_pass = json.loads(fail_to_pass_str) if isinstance(fail_to_pass_str, str) else fail_to_pass_str
+            pass_to_pass = json.loads(pass_to_pass_str) if isinstance(pass_to_pass_str, str) else pass_to_pass_str
+
+            return fail_to_pass or [], pass_to_pass or []
+        except Exception:
+            return [], []
+
     @tool_function(
         description="Enhanced task completion with verification",
         parameters=[
@@ -852,8 +1068,11 @@ class BaseTools(Tool):
         expected_files: List[str] = None,
         expected_functionality: str = None
     ) -> Dict[str, Any]:
-        """Enhanced task completion with verification."""
+        """Enhanced task completion with verification - automatically handles SWE tasks."""
         try:
+            # 自动检测SWE任务
+            is_swe_task = self._detect_swe_task()
+
             if not verify_task:
                 # Skip verification, finish immediately
                 return {
@@ -862,11 +1081,16 @@ class BaseTools(Tool):
                         "done": True,
                         "message": message,
                         "item_id": self.item_id,
+                        "task_type": "swe" if is_swe_task else "regular",
                         "verification_skipped": True
                     }
                 }
 
-            # Perform task verification
+            # SWE任务专用验证流程
+            if is_swe_task:
+                return self._finish_swe_task_verification(message)
+
+            # 普通任务验证流程
             verification_result = self._verify_task_completion(expected_files, expected_functionality)
 
             if not verification_result["completed"]:
@@ -895,6 +1119,110 @@ class BaseTools(Tool):
 
         except Exception as e:
             return {"success": False, "error": f"Task completion failed: {e}"}
+
+    def _finish_swe_task_verification(self, message: str) -> Dict[str, Any]:
+        """SWE任务专用验证逻辑"""
+        try:
+            # 获取SWE测试要求
+            fail_to_pass, pass_to_pass = self._extract_swe_test_info()
+
+            if not fail_to_pass and not pass_to_pass:
+                return {
+                    "success": False,
+                    "error": "No SWE test requirements found in task",
+                    "result": {
+                        "verification_failed": True,
+                        "message": "Cannot validate SWE task - no test requirements specified"
+                    }
+                }
+
+            # 运行SWE测试验证
+            work_root = self._get_session_work_root()
+            if not work_root:
+                return {
+                    "success": False,
+                    "error": "No work root found for SWE task validation"
+                }
+
+            # 使用env_management工具运行pytest (需要先在env_management中添加智能pytest工具)
+            from tools.env_management import EnvManagementTool
+            env_tool = EnvManagementTool(self.item_id)
+
+            # 运行FAIL_TO_PASS测试
+            all_tests_passed = True
+            test_results = {"fail_to_pass": {}, "pass_to_pass": {}}
+
+            for test in fail_to_pass:
+                try:
+                    result = env_tool.env_management__run_pytest_smart(
+                        test_paths=[test],
+                        working_dir=work_root,
+                        auto_fix_deps=True
+                    )
+                    passed = result.get("success", False) and result.get("result", {}).get("test_passed", False)
+                    test_results["fail_to_pass"][test] = passed
+                    if not passed:
+                        all_tests_passed = False
+                except Exception as e:
+                    test_results["fail_to_pass"][test] = False
+                    all_tests_passed = False
+
+            # 运行PASS_TO_PASS测试
+            for test in pass_to_pass:
+                try:
+                    result = env_tool.env_management__run_pytest_smart(
+                        test_paths=[test],
+                        working_dir=work_root,
+                        auto_fix_deps=True
+                    )
+                    passed = result.get("success", False) and result.get("result", {}).get("test_passed", False)
+                    test_results["pass_to_pass"][test] = passed
+                    if not passed:
+                        all_tests_passed = False
+                except Exception as e:
+                    test_results["pass_to_pass"][test] = False
+                    all_tests_passed = False
+
+            if not all_tests_passed:
+                failed_tests = []
+                for test, passed in test_results["fail_to_pass"].items():
+                    if not passed:
+                        failed_tests.append(f"FAIL_TO_PASS: {test}")
+                for test, passed in test_results["pass_to_pass"].items():
+                    if not passed:
+                        failed_tests.append(f"PASS_TO_PASS: {test}")
+
+                return {
+                    "success": False,
+                    "error": "SWE test requirements not met",
+                    "result": {
+                        "verification_failed": True,
+                        "swe_test_results": test_results,
+                        "failed_tests": failed_tests,
+                        "message": f"SWE verification failed: {len(failed_tests)} tests did not meet requirements"
+                    }
+                }
+
+            # SWE验证通过
+            return {
+                "success": True,
+                "result": {
+                    "done": True,
+                    "message": message,
+                    "item_id": self.item_id,
+                    "task_type": "swe",
+                    "swe_verification_passed": True,
+                    "swe_test_results": test_results,
+                    "fail_to_pass_count": len(fail_to_pass),
+                    "pass_to_pass_count": len(pass_to_pass)
+                }
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"SWE task verification failed: {str(e)}"
+            }
 
     def _verify_task_completion(
         self,
@@ -928,3 +1256,112 @@ class BaseTools(Tool):
             "completed_items": completed_items,
             "next_steps": [f"Create or fix: {item}" for item in missing_items]
         }
+
+    @tool_function(
+        description="Generate a patch file containing all changes made during the session. This is the preferred way to complete SWE tasks.",
+        parameters=[
+            ToolParameter("patch_message", "string", "Description of what this patch fixes or implements", required=True),
+            ToolParameter("base_commit", "string", "Base commit to generate patch against (optional)", required=False),
+        ],
+        returns="Generated patch content and metadata",
+        category=ToolCategory.BASE_TOOLS,
+    )
+    def base_tools__generate_patch(
+        self,
+        patch_message: str,
+        base_commit: str = None
+    ) -> Dict[str, Any]:
+        """Generate a patch file with all changes made during the session."""
+        try:
+            work_root = self._get_session_work_root()
+            if not work_root:
+                return {
+                    "success": False,
+                    "error": "No work root set. Initialize workspace first."
+                }
+
+            work_path = Path(work_root)
+            if not work_path.exists():
+                return {
+                    "success": False,
+                    "error": f"Work root directory does not exist: {work_root}"
+                }
+
+            # Check if this is a git repository
+            git_dir = work_path / ".git"
+            if not git_dir.exists():
+                return {
+                    "success": False,
+                    "error": "Not a git repository. Cannot generate patch."
+                }
+
+            # Generate git diff to create patch
+            import subprocess
+
+            try:
+                # Get current changes as patch
+                if base_commit:
+                    # Generate patch against specific commit
+                    result = subprocess.run([
+                        "git", "diff", base_commit, "--", "."
+                    ], cwd=str(work_path), capture_output=True, text=True, check=True)
+                else:
+                    # Generate patch against HEAD (staged + unstaged changes)
+                    result = subprocess.run([
+                        "git", "diff", "HEAD", "--", "."
+                    ], cwd=str(work_path), capture_output=True, text=True, check=True)
+
+                patch_content = result.stdout
+
+                if not patch_content.strip():
+                    return {
+                        "success": True,
+                        "result": {
+                            "patch_content": "",
+                            "message": "No changes detected - patch is empty",
+                            "files_changed": 0
+                        }
+                    }
+
+                # Count changed files
+                lines = patch_content.split('\n')
+                files_changed = len([line for line in lines if line.startswith('diff --git')])
+
+                # Save patch to file
+                patch_filename = f"safeflow_patch_{self.item_id}.patch"
+                patch_path = work_path / patch_filename
+
+                patch_header = f"""# SafeFlow Generated Patch
+# Item ID: {self.item_id}
+# Description: {patch_message}
+# Generated at: {datetime.now().isoformat()}
+# Files changed: {files_changed}
+
+"""
+
+                with open(patch_path, 'w', encoding='utf-8') as f:
+                    f.write(patch_header + patch_content)
+
+                return {
+                    "success": True,
+                    "result": {
+                        "patch_content": patch_content,
+                        "patch_file": str(patch_path),
+                        "patch_message": patch_message,
+                        "files_changed": files_changed,
+                        "patch_header": patch_header.strip(),
+                        "item_id": self.item_id
+                    }
+                }
+
+            except subprocess.CalledProcessError as e:
+                return {
+                    "success": False,
+                    "error": f"Git diff failed: {e.stderr}"
+                }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to generate patch: {e}"
+            }

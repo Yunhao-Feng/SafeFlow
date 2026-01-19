@@ -29,7 +29,8 @@ class EnvManagementTool(Tool):
         self,
         item_id: str,
         name: str = "env_management",
-        description: str = "Environment management and bash command execution"
+        description: str = "Environment management and bash command execution",
+        work_root_provider=None
     ):
         super().__init__(
             name=name,
@@ -39,6 +40,7 @@ class EnvManagementTool(Tool):
         self.item_id = item_id
         self.default_timeout = 30  # Default 30 second timeout
         self.max_timeout = 300     # Maximum 5 minute timeout
+        self.work_root_provider = work_root_provider  # Function to get current work_root
 
     @tool_function(
         description="Execute bash commands with timeout and error handling. Supports most shell operations like installing packages, compiling, running scripts, file operations, etc.",
@@ -60,7 +62,10 @@ class EnvManagementTool(Tool):
         capture_output: bool = True,
         shell_env: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
-        """Execute bash command with comprehensive error handling."""
+        """Execute bash command with comprehensive error handling and partial output capture."""
+
+        MAX_OUTPUT_TOKENS = 100000  # Approximately 100,000 tokens
+        MAX_OUTPUT_CHARS = MAX_OUTPUT_TOKENS * 4  # Rough estimate: 1 token = ~4 chars
 
         try:
             # Validate and sanitize inputs
@@ -77,7 +82,15 @@ class EnvManagementTool(Tool):
                     return {"success": False, "error": f"Working directory does not exist: {working_dir}"}
                 cwd = str(work_path)
             else:
-                cwd = os.getcwd()
+                # Use work_root from provider if available, fallback to os.getcwd()
+                if self.work_root_provider:
+                    work_root = self.work_root_provider()
+                    if work_root:
+                        cwd = str(work_root)
+                    else:
+                        cwd = os.getcwd()
+                else:
+                    cwd = os.getcwd()
 
             # Setup environment
             env = os.environ.copy()
@@ -92,53 +105,127 @@ class EnvManagementTool(Tool):
                 "pid": None
             }
 
-            # Execute command
-            if capture_output:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=cwd,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_seconds
-                )
+            # Always use real-time capture to handle timeouts properly
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=0,  # Unbuffered for real-time capture
+                universal_newlines=True
+            )
 
-                stdout = result.stdout.strip() if result.stdout else ""
-                stderr = result.stderr.strip() if result.stderr else ""
-                return_code = result.returncode
+            exec_info["pid"] = process.pid
 
-            else:
-                # For commands that need to show real-time output
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    cwd=cwd,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True
-                )
+            # Capture output in real-time with timeout handling
+            stdout_lines = []
+            stderr_lines = []
+            stdout_size = 0
+            stderr_size = 0
+            timed_out = False
 
-                exec_info["pid"] = process.pid
+            import select
+            import time
+
+            start_time = time.time()
+
+            # Set up file descriptors for select
+            stdout_fd = process.stdout.fileno()
+            stderr_fd = process.stderr.fileno()
+
+            # Make file descriptors non-blocking
+            import fcntl
+            fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            fl = fcntl.fcntl(stderr_fd, fcntl.F_GETFL)
+            fcntl.fcntl(stderr_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+            def _truncate_if_needed(content: str, content_size: int) -> tuple[str, int]:
+                """Truncate content if it exceeds the maximum size."""
+                if content_size > MAX_OUTPUT_CHARS:
+                    truncated = content[:MAX_OUTPUT_CHARS]
+                    truncation_msg = f"\n\n[OUTPUT TRUNCATED - showing first {MAX_OUTPUT_CHARS} characters out of {content_size}]"
+                    return truncated + truncation_msg, len(truncated + truncation_msg)
+                return content, content_size
+
+            try:
+                while process.poll() is None:
+                    # Check timeout
+                    if time.time() - start_time > timeout_seconds:
+                        timed_out = True
+                        process.terminate()
+                        time.sleep(0.1)  # Give process a moment to terminate gracefully
+                        if process.poll() is None:
+                            process.kill()
+                        break
+
+                    # Use select to check for available data
+                    ready, _, _ = select.select([stdout_fd, stderr_fd], [], [], 0.1)
+
+                    if stdout_fd in ready:
+                        try:
+                            chunk = process.stdout.read()
+                            if chunk:
+                                stdout_lines.append(chunk)
+                                stdout_size += len(chunk)
+                        except (BlockingIOError, OSError):
+                            pass
+
+                    if stderr_fd in ready:
+                        try:
+                            chunk = process.stderr.read()
+                            if chunk:
+                                stderr_lines.append(chunk)
+                                stderr_size += len(chunk)
+                        except (BlockingIOError, OSError):
+                            pass
+
+                # Read any remaining output after process ends
+                try:
+                    remaining_stdout = process.stdout.read()
+                    if remaining_stdout:
+                        stdout_lines.append(remaining_stdout)
+                        stdout_size += len(remaining_stdout)
+                except:
+                    pass
 
                 try:
-                    stdout, _ = process.communicate(timeout=timeout_seconds)
-                    return_code = process.returncode
-                    stderr = ""
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, _ = process.communicate()
-                    return {
-                        "success": False,
-                        "error": f"Command timed out after {timeout_seconds} seconds",
-                        "stdout": stdout.strip() if stdout else "",
-                        "stderr": "Timeout",
-                        "return_code": -1,
-                        "execution_info": exec_info
-                    }
+                    remaining_stderr = process.stderr.read()
+                    if remaining_stderr:
+                        stderr_lines.append(remaining_stderr)
+                        stderr_size += len(remaining_stderr)
+                except:
+                    pass
+
+            finally:
+                process.stdout.close()
+                process.stderr.close()
+
+            # Combine and truncate outputs if needed
+            stdout = "".join(stdout_lines)
+            stderr = "".join(stderr_lines)
+
+            stdout, _ = _truncate_if_needed(stdout, stdout_size)
+            stderr, _ = _truncate_if_needed(stderr, stderr_size)
+
+            # Get return code
+            return_code = process.returncode if process.returncode is not None else -1
+
+            # Handle timeout case - return partial output
+            if timed_out:
+                return {
+                    "success": False,
+                    "error": f"Command timed out after {timeout_seconds} seconds",
+                    "stdout": stdout.strip() if stdout else "",
+                    "stderr": stderr.strip() if stderr else "",
+                    "return_code": -1,
+                    "execution_info": exec_info,
+                    "timeout_occurred": True,
+                    "partial_output": True
+                }
 
             # Determine success/failure
             success = return_code == 0
@@ -146,40 +233,22 @@ class EnvManagementTool(Tool):
             # Prepare result
             result_data = {
                 "success": success,
-                "stdout": stdout,
-                "stderr": stderr,
+                "stdout": stdout.strip() if stdout else "",
+                "stderr": stderr.strip() if stderr else "",
                 "return_code": return_code,
-                "execution_info": exec_info
+                "execution_info": exec_info,
+                "timeout_occurred": False,
+                "partial_output": False
             }
 
             # Add error message if command failed
             if not success:
-                if stderr:
-                    result_data["error"] = f"Command failed (exit code {return_code}): {stderr}"
+                if stderr.strip():
+                    result_data["error"] = f"Command failed (exit code {return_code}): {stderr.strip()}"
                 else:
                     result_data["error"] = f"Command failed with exit code {return_code}"
 
             return result_data
-
-        except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "error": f"Command timed out after {timeout_seconds} seconds",
-                "stdout": "",
-                "stderr": "Timeout",
-                "return_code": -1,
-                "execution_info": exec_info
-            }
-
-        except subprocess.CalledProcessError as e:
-            return {
-                "success": False,
-                "error": f"Command failed: {e}",
-                "stdout": e.stdout.strip() if e.stdout else "",
-                "stderr": e.stderr.strip() if e.stderr else "",
-                "return_code": e.returncode,
-                "execution_info": exec_info
-            }
 
         except Exception as e:
             return {
@@ -188,7 +257,9 @@ class EnvManagementTool(Tool):
                 "stdout": "",
                 "stderr": str(e),
                 "return_code": -1,
-                "execution_info": exec_info
+                "execution_info": exec_info if 'exec_info' in locals() else {"command": command},
+                "timeout_occurred": False,
+                "partial_output": False
             }
 
     @tool_function(
@@ -262,8 +333,15 @@ class EnvManagementTool(Tool):
         """Get current environment information."""
 
         try:
+            # Get current working directory from work_root_provider if available
+            if self.work_root_provider:
+                work_root = self.work_root_provider()
+                current_dir = str(work_root) if work_root else os.getcwd()
+            else:
+                current_dir = os.getcwd()
+
             env_info = {
-                "current_working_directory": os.getcwd(),
+                "current_working_directory": current_dir,
                 "system_platform": sys.platform,
                 "python_executable": sys.executable,
                 "python_version": sys.version,
@@ -332,7 +410,15 @@ class EnvManagementTool(Tool):
                         break
 
             # Setup working directory
-            cwd = working_dir if working_dir else os.getcwd()
+            if working_dir:
+                cwd = working_dir
+            else:
+                # Use work_root from provider if available, fallback to os.getcwd()
+                if self.work_root_provider:
+                    work_root = self.work_root_provider()
+                    cwd = str(work_root) if work_root else os.getcwd()
+                else:
+                    cwd = os.getcwd()
 
             # Execute with timeout
             result = subprocess.run(
@@ -692,3 +778,195 @@ class EnvManagementTool(Tool):
             "summary": {"security_issues": len(issues)},
             "suggestions": ["Review security issues carefully"] if issues else ["No security issues detected!"]
         }
+
+    @tool_function(
+        description="Intelligent pytest runner with automatic dependency fixing for SWE tasks",
+        parameters=[
+            ToolParameter("test_paths", "array", "Test paths to execute", required=True),
+            ToolParameter("working_dir", "string", "Working directory for test execution", required=True),
+            ToolParameter("auto_fix_deps", "boolean", "Automatically fix dependency issues", default=True),
+            ToolParameter("max_retries", "number", "Maximum number of retry attempts", default=3),
+            ToolParameter("timeout_seconds", "number", "Test execution timeout", default=300),
+            ToolParameter("pytest_args", "array", "Additional pytest arguments", required=False),
+        ],
+        returns="Smart pytest execution results with dependency fixing",
+        category=ToolCategory.ENV_MANAGEMENT,
+    )
+    def env_management__run_pytest_smart(
+        self,
+        test_paths: List[str],
+        working_dir: str,
+        auto_fix_deps: bool = True,
+        max_retries: int = 3,
+        timeout_seconds: int = 300,
+        pytest_args: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Run pytest with intelligent error recovery and dependency management"""
+        try:
+            working_dir = Path(working_dir).resolve()
+            pytest_args = pytest_args or ["-v", "--tb=short"]
+
+            if not working_dir.exists():
+                return {
+                    "success": False,
+                    "error": f"Working directory does not exist: {working_dir}"
+                }
+
+            attempts = []
+            last_error = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    # 构建pytest命令
+                    cmd_parts = ["python", "-m", "pytest"] + test_paths + pytest_args
+                    cmd = " ".join(cmd_parts)
+
+                    # 运行测试
+                    result = self.env_management__execute_bash(
+                        command=cmd,
+                        working_dir=str(working_dir),
+                        timeout_seconds=timeout_seconds
+                    )
+
+                    attempt_result = {
+                        "attempt": attempt + 1,
+                        "command": cmd,
+                        "success": result.get("success", False),
+                        "stdout": result.get("stdout", ""),
+                        "stderr": result.get("stderr", ""),
+                        "return_code": result.get("return_code", -1)
+                    }
+
+                    attempts.append(attempt_result)
+
+                    # 如果成功，返回结果
+                    if result.get("success", False):
+                        test_summary = self._parse_pytest_output(result.get("stdout", ""))
+                        return {
+                            "success": True,
+                            "result": {
+                                "test_passed": True,
+                                "test_summary": test_summary,
+                                "attempts": attempts,
+                                "final_result": attempt_result,
+                                "fixes_applied": attempt > 0
+                            }
+                        }
+
+                    # 如果失败但不是最后一次尝试，尝试修复依赖
+                    if auto_fix_deps and attempt < max_retries:
+                        error_output = result.get("stderr", "") + result.get("stdout", "")
+                        fix_applied = self._attempt_dependency_fix(error_output, working_dir)
+                        attempt_result["fix_attempted"] = fix_applied
+
+                    last_error = result.get("stderr", "") or result.get("error", "Unknown error")
+
+                except Exception as e:
+                    attempt_result = {
+                        "attempt": attempt + 1,
+                        "error": str(e),
+                        "success": False
+                    }
+                    attempts.append(attempt_result)
+                    last_error = str(e)
+
+            # 所有尝试都失败了
+            return {
+                "success": False,
+                "error": f"All test attempts failed. Last error: {last_error}",
+                "result": {
+                    "test_passed": False,
+                    "attempts": attempts,
+                    "total_attempts": len(attempts)
+                }
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Smart pytest execution failed: {str(e)}"
+            }
+
+    def _attempt_dependency_fix(self, error_output: str, working_dir: Path) -> bool:
+        """尝试根据错误输出修复依赖问题"""
+        fixes_applied = False
+
+        # 常见依赖问题的修复映射
+        dependency_fixes = [
+            (r"ModuleNotFoundError.*hypothesis", ["pip", "install", "hypothesis"]),
+            (r"ModuleNotFoundError.*pytest", ["pip", "install", "pytest"]),
+            (r"extension_helpers", ["pip", "install", "extension-helpers"]),
+            (r"setuptools\.dep_util", ["pip", "install", "setuptools<60.0.0"]),
+            (r"ImportError.*setuptools\.dep_util", ["pip", "install", "setuptools<50.0.0"]),
+            (r"could not determine.*package version", ["pip", "install", "-e", "."]),
+            (r"ModuleNotFoundError.*numpy", ["pip", "install", "numpy"]),
+            (r"ModuleNotFoundError.*scipy", ["pip", "install", "scipy"]),
+        ]
+
+        for pattern, fix_cmd in dependency_fixes:
+            if re.search(pattern, error_output, re.IGNORECASE):
+                try:
+                    result = subprocess.run(
+                        fix_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        cwd=working_dir
+                    )
+                    if result.returncode == 0:
+                        fixes_applied = True
+                        break  # 只应用一个修复
+                except Exception:
+                    pass  # 修复失败，继续尝试其他修复
+
+        return fixes_applied
+
+    def _parse_pytest_output(self, output: str) -> Dict[str, Any]:
+        """解析pytest输出"""
+        summary = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "success": False}
+
+        try:
+            # 查找pytest结果行 (例如: "= 3 failed, 2 passed in 1.23s =")
+            result_lines = [line for line in output.split('\n') if '=' in line and ('passed' in line or 'failed' in line)]
+
+            if result_lines:
+                result_line = result_lines[-1]  # 取最后一个结果行
+
+                # 解析数字
+                import re
+                passed_match = re.search(r'(\d+)\s+passed', result_line)
+                failed_match = re.search(r'(\d+)\s+failed', result_line)
+                error_match = re.search(r'(\d+)\s+error', result_line)
+
+                passed = int(passed_match.group(1)) if passed_match else 0
+                failed = int(failed_match.group(1)) if failed_match else 0
+                errors = int(error_match.group(1)) if error_match else 0
+
+                summary.update({
+                    "passed": passed,
+                    "failed": failed,
+                    "errors": errors,
+                    "total": passed + failed + errors,
+                    "success": failed == 0 and errors == 0
+                })
+            else:
+                # 简单的PASSED/FAILED计数
+                passed = len(re.findall(r"PASSED", output))
+                failed = len(re.findall(r"FAILED", output))
+                errors = len(re.findall(r"ERROR", output))
+
+                if passed > 0 or failed > 0 or errors > 0:
+                    summary.update({
+                        "passed": passed,
+                        "failed": failed,
+                        "errors": errors,
+                        "total": passed + failed + errors,
+                        "success": failed == 0 and errors == 0
+                    })
+
+        except Exception:
+            # 如果解析失败，至少检查是否包含成功指标
+            if "PASSED" in output and "FAILED" not in output:
+                summary["success"] = True
+
+        return summary
