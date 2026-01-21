@@ -1,9 +1,6 @@
-import json
-import os
 import re
 import shutil
 import subprocess
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -140,10 +137,6 @@ class BaseTools(Tool):
     Minimal, non-overlapping orchestration tools
     """
 
-    # Class-level initialization tracking (shared across instances with same item_id)
-    _initialized_sessions: Dict[str, bool] = {}
-    _session_work_roots: Dict[str, str] = {}
-
     def __init__(
         self,
         item_id: str,
@@ -160,21 +153,6 @@ class BaseTools(Tool):
 
         # Set work_root directly if provided
         self.work_root = Path(work_root).resolve() if work_root else Path.cwd().resolve()
-        self._task_blob_preview: Optional[str] = None
-
-    def _is_session_initialized(self) -> bool:
-        """Check if current session (item_id) is already initialized."""
-        return self._initialized_sessions.get(self.item_id, False)
-
-    def _mark_session_initialized(self, work_root: str = None):
-        """Mark current session as initialized."""
-        self._initialized_sessions[self.item_id] = True
-        if work_root:
-            self._session_work_roots[self.item_id] = work_root
-
-    def _get_session_work_root(self) -> Optional[str]:
-        """Get work root for current session if exists."""
-        return self._session_work_roots.get(self.item_id)
 
     def get_current_work_root(self) -> Optional[Path]:
         """Get current work root as Path object for external access."""
@@ -206,31 +184,6 @@ class BaseTools(Tool):
                 "success": False,
                 "error": str(e)
             }
-
-    def base_tools__initialize_context(
-        self,
-        task_blob: str,
-        preview_chars: int = 40000,
-        include_hidden: bool = False,
-        max_entries: int = 50,
-    ) -> Dict[str, Any]:
-
-        cwd = Path.cwd().resolve()
-        self._task_blob_preview = _truncate(task_blob, int(preview_chars))
-
-        return {
-            "success": True,
-            "result": {
-                "item_id": self.item_id,
-                "cwd": str(cwd),
-                "cwd_entries": _list_one_layer(cwd, include_hidden=include_hidden, max_entries=int(max_entries)),
-                "work_root": str(self.work_root) if self.work_root else None,
-                "task_blob_preview": self._task_blob_preview,
-                "capabilities": {
-                    "git_available": shutil.which("git") is not None,
-                },
-            },
-        }
     
     @tool_function(
         description="Set the working root directory for subsequent operations. Path is resolved relative to cwd if not absolute.",
@@ -270,15 +223,11 @@ class BaseTools(Tool):
             
             self.work_root = p
 
-            # Mark session as initialized when work_root is set
-            self._mark_session_initialized(str(p))
-
             return {
                 "success": True,
                 "result": {
                     "work_root": str(self.work_root),
                     "work_root_entries": _list_one_layer(self.work_root, include_hidden=include_hidden, max_entries=int(max_entries)),
-                    "session_initialized": True,
                 },
             }
         except Exception as e:
@@ -498,399 +447,6 @@ class BaseTools(Tool):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def base_tools__analyze_task_type(self, task_blob: str) -> Dict[str, Any]:
-        """Detect SWE vs regular task and recommend workspace setup."""
-        try:
-            import json
-            import re
-
-            # Try to parse as JSON (SWE-bench format)
-            swe_analysis = {"is_swe_task": False, "confidence": "high"}
-
-            try:
-                task_data = json.loads(task_blob)
-
-                # Check for SWE-bench indicators
-                swe_indicators = [
-                    "instance_id", "repo", "base_commit", "patch",
-                    "test_patch", "problem_statement", "hints_text"
-                ]
-
-                found_indicators = [key for key in swe_indicators if key in task_data]
-
-                if len(found_indicators) >= 3:  # Strong SWE indication
-                    swe_analysis = {
-                        "is_swe_task": True,
-                        "confidence": "high",
-                        "repo": task_data.get("repo"),
-                        "instance_id": task_data.get("instance_id"),
-                        "base_commit": task_data.get("base_commit"),
-                        "found_indicators": found_indicators
-                    }
-
-            except json.JSONDecodeError:
-                # Check for SWE patterns in text
-                swe_patterns = [
-                    r"instance_id[:\s]+\w+",
-                    r"repo[:\s]+[\w\-_/]+",
-                    r"base_commit[:\s]+[a-f0-9]{7,}",
-                    r"problem_statement[:\s]",
-                ]
-
-                found_patterns = []
-                for pattern in swe_patterns:
-                    if re.search(pattern, task_blob, re.IGNORECASE):
-                        found_patterns.append(pattern)
-
-                if len(found_patterns) >= 2:
-                    swe_analysis = {
-                        "is_swe_task": True,
-                        "confidence": "medium",
-                        "found_patterns": found_patterns
-                    }
-
-            # Generate workspace recommendations
-            cwd = Path.cwd().resolve()
-            cwd_entries = list(cwd.iterdir()) if cwd.exists() else []
-            cwd_empty = len(cwd_entries) == 0
-
-            if swe_analysis["is_swe_task"]:
-                if cwd_empty:
-                    recommendation = {
-                        "strategy": "clone_to_cwd",
-                        "work_root": str(cwd),
-                        "reason": "Empty cwd, can clone SWE repo directly"
-                    }
-                else:
-                    recommendation = {
-                        "strategy": "clone_to_subdir",
-                        "work_root": str(cwd / "swe_workspace"),
-                        "reason": "Non-empty cwd, clone to subdirectory"
-                    }
-                recommendation["requires_clone"] = True
-                recommendation["repo_info"] = {
-                    "repo": swe_analysis.get("repo"),
-                    "base_commit": swe_analysis.get("base_commit")
-                }
-            else:
-                # Regular task
-                has_code = any(p.suffix in {'.py', '.js', '.java', '.cpp', '.go'}
-                             for p in cwd_entries if p.is_file())
-
-                if has_code:
-                    recommendation = {
-                        "strategy": "use_existing_cwd",
-                        "work_root": str(cwd),
-                        "reason": "Existing code project in cwd"
-                    }
-                elif cwd_empty:
-                    recommendation = {
-                        "strategy": "use_cwd_as_workspace",
-                        "work_root": str(cwd),
-                        "reason": "Empty cwd, use as workspace"
-                    }
-                else:
-                    recommendation = {
-                        "strategy": "create_subdir",
-                        "work_root": str(cwd / "workspace"),
-                        "reason": "Non-empty cwd, create workspace subdir"
-                    }
-                recommendation["requires_clone"] = False
-
-            return {
-                "success": True,
-                "result": {
-                    "task_analysis": swe_analysis,
-                    "current_cwd": {
-                        "path": str(cwd),
-                        "empty": cwd_empty,
-                        "entry_count": len(cwd_entries)
-                    },
-                    "recommendation": recommendation
-                }
-            }
-
-        except Exception as e:
-            return {"success": False, "error": f"Task analysis failed: {e}"}
-
-
-    @tool_function(
-        description="Complete initialization workflow: analyze task, set workspace, clone repo if needed, summarize.",
-        parameters=[
-            ToolParameter("task_blob", "string", "Raw task description or SWE-bench JSON", required=True),
-            ToolParameter("force_reinit", "boolean", "Force re-initialization even if already initialized", required=False, default=False),
-        ],
-        returns="Complete initialization result",
-        category=ToolCategory.BASE_TOOLS,
-    )
-    def base_tools__complete_initialization(
-        self,
-        task_blob: str,
-        force_reinit: bool = False
-    ) -> Dict[str, Any]:
-        """Execute complete initialization workflow with smart environment detection."""
-        try:
-            # Step 1: Check if already initialized
-            if self._is_session_initialized() and not force_reinit:
-                existing_work_root = self._get_session_work_root()
-                return {
-                    "success": True,
-                    "result": {
-                        "already_initialized": True,
-                        "work_root": existing_work_root,
-                        "message": "Session already initialized. Use force_reinit=true to reinitialize."
-                    }
-                }
-
-            # Step 2: Smart environment detection - check if we're already in a prepared environment
-            # If work_root is already set and points to a valid git repository, don't recreate
-            if self.work_root and self.work_root.exists():
-                # Check if it's already a git repository
-                git_dir = self.work_root / ".git"
-                if git_dir.exists():
-                    # We're already in a prepared repository, just use it
-                    self._mark_session_initialized(str(self.work_root))
-
-                    # Still do workspace summary for awareness
-                    summary_result = self.base_tools__summarize_work_root()
-                    workspace_summary = {}
-                    if summary_result["success"]:
-                        workspace_summary = summary_result["result"]["summaries"]
-
-                    return {
-                        "success": True,
-                        "result": {
-                            "initialization_completed": True,
-                            "work_root": str(self.work_root),
-                            "workspace_strategy": "use_existing_prepared_repo",
-                            "workspace_summary": workspace_summary,
-                            "message": "Using existing prepared repository environment",
-                            "steps_completed": ["existing_environment_detected", "workspace_summary"]
-                        }
-                    }
-
-            # Step 3: Initialize context (explore current directory)
-            context_result = self.base_tools__initialize_context(task_blob)
-            if not context_result["success"]:
-                return {"success": False, "error": f"Context initialization failed: {context_result['error']}"}
-
-            cwd_info = context_result["result"]
-
-            # Step 4: Analyze task type and get workspace recommendation
-            analysis_result = self.base_tools__analyze_task_type(task_blob)
-            if not analysis_result["success"]:
-                return {"success": False, "error": f"Task analysis failed: {analysis_result['error']}"}
-
-            analysis = analysis_result["result"]
-            recommendation = analysis["recommendation"]
-
-            # Step 5: Set work root based on recommendation (only if not already set appropriately)
-            if not self.work_root or not self.work_root.exists():
-                work_root_result = self.base_tools__set_work_root(
-                    path=recommendation["work_root"],
-                    create=True
-                )
-                if not work_root_result["success"]:
-                    return {"success": False, "error": f"Work root setup failed: {work_root_result['error']}"}
-                work_root = work_root_result["result"]["work_root"]
-            else:
-                work_root = str(self.work_root)
-
-            # Step 6: Clone repository only if needed and destination doesn't already exist
-            clone_result = None
-            if recommendation.get("requires_clone") and recommendation.get("repo_info", {}).get("repo"):
-                repo_info = recommendation["repo_info"]
-
-                # Check if repository already exists in the target location
-                repo_name = repo_info["repo"].split("/")[-1]
-                potential_repo_path = self.work_root / repo_name
-
-                if potential_repo_path.exists() and (potential_repo_path / ".git").exists():
-                    # Repository already exists, don't clone again
-                    clone_result = {
-                        "result": {
-                            "dest": str(potential_repo_path),
-                            "message": "Repository already exists, skipped cloning"
-                        }
-                    }
-                    # Update work_root to the existing repository
-                    self.work_root = potential_repo_path.resolve()
-                    work_root = str(self.work_root)
-                else:
-                    # Determine destination subdirectory
-                    if recommendation["strategy"] == "clone_to_cwd":
-                        dest_subdir = "."
-                    else:
-                        dest_subdir = "repo"
-
-                    clone_result = self.base_tools__git_clone(
-                        repo=repo_info["repo"],
-                        dest_subdir=dest_subdir,
-                        checkout=repo_info.get("base_commit", "")
-                    )
-
-                    if not clone_result["success"]:
-                        return {"success": False, "error": f"Git clone failed: {clone_result['error']}"}
-
-                    # Update work_root to the cloned repository directory
-                    cloned_repo_path = clone_result["result"]["dest"]
-                    self.work_root = Path(cloned_repo_path).resolve()
-                    work_root = str(self.work_root)
-
-            # Step 7: Summarize workspace
-            summary_result = self.base_tools__summarize_work_root()
-            workspace_summary = {}
-            if summary_result["success"]:
-                workspace_summary = summary_result["result"]["summaries"]
-
-            # Compile final result
-            result = {
-                "initialization_completed": True,
-                "task_analysis": analysis,
-                "work_root": work_root,
-                "workspace_strategy": recommendation["strategy"],
-                "cwd_info": cwd_info,
-                "workspace_summary": workspace_summary,
-                "steps_completed": [
-                    "context_initialization",
-                    "task_analysis",
-                    "workspace_setup"
-                ]
-            }
-
-            if clone_result:
-                result["git_clone"] = clone_result["result"]
-                if "skipped" not in clone_result["result"].get("message", ""):
-                    result["steps_completed"].append("repository_clone")
-                else:
-                    result["steps_completed"].append("existing_repository_detected")
-
-            result["steps_completed"].append("workspace_summary")
-
-            # Mark session as initialized
-            self._mark_session_initialized(work_root)
-
-            return {
-                "success": True,
-                "result": result
-            }
-
-        except Exception as e:
-            return {"success": False, "error": f"Complete initialization failed: {e}"}
-
-    @tool_function(
-        description="Unified session state management: check, save, or get current work context",
-        parameters=[
-            ToolParameter("action", "string", "Action: 'check', 'save', 'get_context'", required=True),
-            ToolParameter("work_root", "string", "Work root path for saving state", required=False),
-            ToolParameter("current_task", "string", "Current task description", required=False),
-            ToolParameter("completed_steps", "array", "List of completed steps", required=False),
-        ],
-        returns="Session state information",
-        category=ToolCategory.BASE_TOOLS,
-    )
-    def base_tools__session_state(
-        self,
-        action: str,
-        work_root: str = None,
-        current_task: str = None,
-        completed_steps: List[str] = None
-    ) -> Dict[str, Any]:
-        """Unified session state management with persistent context tracking."""
-        try:
-            if action == "check":
-                # Return comprehensive session status
-                initialized = self._is_session_initialized()
-                current_work_root = self._get_session_work_root()
-
-                # Try to load additional state from context file if it exists
-                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
-                additional_context = {}
-                if context_file.exists():
-                    try:
-                        import json
-                        with open(context_file, 'r') as f:
-                            additional_context = json.load(f)
-                    except Exception:
-                        pass
-
-                return {
-                    "success": True,
-                    "result": {
-                        "initialized": initialized,
-                        "item_id": self.item_id,
-                        "work_root": current_work_root,
-                        "message": "Already initialized" if initialized else "Not initialized",
-                        "last_activity": additional_context.get("last_activity"),
-                        "current_task": additional_context.get("current_task"),
-                        "completed_steps": additional_context.get("completed_steps", [])
-                    }
-                }
-
-            elif action == "save":
-                # Save current state including work_root and task info
-                if work_root:
-                    self._mark_session_initialized(work_root)
-
-                # Save extended context to file
-                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
-                import json
-                from datetime import datetime
-
-                context_data = {
-                    "item_id": self.item_id,
-                    "initialized": True,
-                    "work_root": work_root or self._get_session_work_root(),
-                    "current_task": current_task,
-                    "completed_steps": completed_steps or [],
-                    "last_activity": datetime.now().isoformat()
-                }
-
-                with open(context_file, 'w') as f:
-                    json.dump(context_data, f, indent=2)
-
-                return {
-                    "success": True,
-                    "result": {
-                        "saved": True,
-                        "context_file": str(context_file),
-                        "work_root": context_data["work_root"]
-                    }
-                }
-
-            elif action == "get_context":
-                # Get full current context for agent awareness
-                current_work_root = self._get_session_work_root()
-                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
-
-                context_data = {
-                    "work_root": current_work_root,
-                    "initialized": self._is_session_initialized(),
-                    "item_id": self.item_id
-                }
-
-                if context_file.exists():
-                    try:
-                        import json
-                        with open(context_file, 'r') as f:
-                            saved_context = json.load(f)
-                            context_data.update(saved_context)
-                    except Exception:
-                        pass
-
-                return {
-                    "success": True,
-                    "result": context_data
-                }
-
-            else:
-                return {
-                    "success": False,
-                    "error": f"Invalid action '{action}'. Must be 'check', 'save', or 'get_context'"
-                }
-
-        except Exception as e:
-            return {"success": False, "error": f"Session state operation failed: {e}"}
 
     @tool_function(
         description="Verify current environment and dependencies",
@@ -912,7 +468,7 @@ class BaseTools(Tool):
 
         try:
             result = {
-                "work_root": self._get_session_work_root(),
+                "work_root": str(self.work_root) if self.work_root else None,
                 "current_directory": str(Path.cwd()),
                 "environment_ok": True,
                 "issues": []
@@ -966,64 +522,6 @@ class BaseTools(Tool):
         except Exception as e:
             return {"success": False, "error": f"Environment verification failed: {e}"}
 
-    def _detect_swe_task(self) -> bool:
-        """检测当前是否为SWE任务"""
-        try:
-            # 检查是否有task_blob_preview (从初始化过程中保存)
-            if hasattr(self, '_task_blob_preview') and self._task_blob_preview:
-                task_blob_str = self._task_blob_preview
-            else:
-                # 尝试从context文件读取
-                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
-                if context_file.exists():
-                    with open(context_file, 'r') as f:
-                        context_data = json.load(f)
-                        task_blob_str = context_data.get('task_blob', '')
-                else:
-                    return False
-
-            # 检测SWE特有指标
-            swe_indicators = [
-                'FAIL_TO_PASS', 'PASS_TO_PASS', 'instance_id',
-                'base_commit', 'test_patch', 'problem_statement'
-            ]
-
-            return any(indicator in task_blob_str for indicator in swe_indicators)
-        except Exception:
-            return False
-
-    def _extract_swe_test_info(self) -> tuple:
-        """从任务信息中提取FAIL_TO_PASS和PASS_TO_PASS测试列表"""
-        try:
-            # 获取完整的task_blob
-            task_blob_str = ""
-            if hasattr(self, '_task_blob_preview') and self._task_blob_preview:
-                task_blob_str = self._task_blob_preview
-            else:
-                # 尝试从context文件读取
-                context_file = Path.cwd() / f".safeflow_context_{self.item_id}.json"
-                if context_file.exists():
-                    with open(context_file, 'r') as f:
-                        context_data = json.load(f)
-                        task_blob_str = context_data.get('task_blob', '')
-
-            if not task_blob_str:
-                return [], []
-
-            # 解析为JSON
-            task_data = json.loads(task_blob_str)
-
-            # 解析测试列表
-            fail_to_pass_str = task_data.get('FAIL_TO_PASS', '[]')
-            pass_to_pass_str = task_data.get('PASS_TO_PASS', '[]')
-
-            fail_to_pass = json.loads(fail_to_pass_str) if isinstance(fail_to_pass_str, str) else fail_to_pass_str
-            pass_to_pass = json.loads(pass_to_pass_str) if isinstance(pass_to_pass_str, str) else pass_to_pass_str
-
-            return fail_to_pass or [], pass_to_pass or []
-        except Exception:
-            return [], []
-
     @tool_function(
         description="Enhanced task completion with verification",
         parameters=[
@@ -1042,11 +540,8 @@ class BaseTools(Tool):
         expected_files: List[str] = None,
         expected_functionality: str = None
     ) -> Dict[str, Any]:
-        """Enhanced task completion with verification - automatically handles SWE tasks."""
+        """Enhanced task completion with verification."""
         try:
-            # 自动检测SWE任务
-            is_swe_task = self._detect_swe_task()
-
             if not verify_task:
                 # Skip verification, finish immediately
                 return {
@@ -1055,14 +550,9 @@ class BaseTools(Tool):
                         "done": True,
                         "message": message,
                         "item_id": self.item_id,
-                        "task_type": "swe" if is_swe_task else "regular",
                         "verification_skipped": True
                     }
                 }
-
-            # SWE任务专用验证流程
-            if is_swe_task:
-                return self._finish_swe_task_verification(message)
 
             # 普通任务验证流程
             verification_result = self._verify_task_completion(expected_files, expected_functionality)
@@ -1082,121 +572,17 @@ class BaseTools(Tool):
             # Task verification passed
             return {
                 "success": True,
-                "result": {
-                    "done": True,
-                    "message": message,
-                    "item_id": self.item_id,
-                    "verification_passed": True,
-                    "verified_items": verification_result.get("completed_items", [])
+                    "result": {
+                        "done": True,
+                        "message": message,
+                        "item_id": self.item_id,
+                        "verification_passed": True,
+                        "verified_items": verification_result.get("completed_items", [])
                 }
             }
 
         except Exception as e:
             return {"success": False, "error": f"Task completion failed: {e}"}
-
-    def _finish_swe_task_verification(self, message: str) -> Dict[str, Any]:
-        """SWE任务专用验证逻辑"""
-        try:
-            # 获取SWE测试要求
-            fail_to_pass, pass_to_pass = self._extract_swe_test_info()
-
-            if not fail_to_pass and not pass_to_pass:
-                return {
-                    "success": False,
-                    "error": "No SWE test requirements found in task",
-                    "result": {
-                        "verification_failed": True,
-                        "message": "Cannot validate SWE task - no test requirements specified"
-                    }
-                }
-
-            # 运行SWE测试验证
-            work_root = self._get_session_work_root()
-            if not work_root:
-                return {
-                    "success": False,
-                    "error": "No work root found for SWE task validation"
-                }
-
-            # 使用env_management工具运行pytest (需要先在env_management中添加智能pytest工具)
-            from tools.env_management import EnvManagementTool
-            env_tool = EnvManagementTool(self.item_id)
-
-            # 运行FAIL_TO_PASS测试
-            all_tests_passed = True
-            test_results = {"fail_to_pass": {}, "pass_to_pass": {}}
-
-            for test in fail_to_pass:
-                try:
-                    result = env_tool.env_management__run_pytest_smart(
-                        test_paths=[test],
-                        working_dir=work_root,
-                        auto_fix_deps=True
-                    )
-                    passed = result.get("success", False) and result.get("result", {}).get("test_passed", False)
-                    test_results["fail_to_pass"][test] = passed
-                    if not passed:
-                        all_tests_passed = False
-                except Exception as e:
-                    test_results["fail_to_pass"][test] = False
-                    all_tests_passed = False
-
-            # 运行PASS_TO_PASS测试
-            for test in pass_to_pass:
-                try:
-                    result = env_tool.env_management__run_pytest_smart(
-                        test_paths=[test],
-                        working_dir=work_root,
-                        auto_fix_deps=True
-                    )
-                    passed = result.get("success", False) and result.get("result", {}).get("test_passed", False)
-                    test_results["pass_to_pass"][test] = passed
-                    if not passed:
-                        all_tests_passed = False
-                except Exception as e:
-                    test_results["pass_to_pass"][test] = False
-                    all_tests_passed = False
-
-            if not all_tests_passed:
-                failed_tests = []
-                for test, passed in test_results["fail_to_pass"].items():
-                    if not passed:
-                        failed_tests.append(f"FAIL_TO_PASS: {test}")
-                for test, passed in test_results["pass_to_pass"].items():
-                    if not passed:
-                        failed_tests.append(f"PASS_TO_PASS: {test}")
-
-                return {
-                    "success": False,
-                    "error": "SWE test requirements not met",
-                    "result": {
-                        "verification_failed": True,
-                        "swe_test_results": test_results,
-                        "failed_tests": failed_tests,
-                        "message": f"SWE verification failed: {len(failed_tests)} tests did not meet requirements"
-                    }
-                }
-
-            # SWE验证通过
-            return {
-                "success": True,
-                "result": {
-                    "done": True,
-                    "message": message,
-                    "item_id": self.item_id,
-                    "task_type": "swe",
-                    "swe_verification_passed": True,
-                    "swe_test_results": test_results,
-                    "fail_to_pass_count": len(fail_to_pass),
-                    "pass_to_pass_count": len(pass_to_pass)
-                }
-            }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"SWE task verification failed: {str(e)}"
-            }
 
     def _verify_task_completion(
         self,
@@ -1212,9 +598,8 @@ class BaseTools(Tool):
             for file_path in expected_files:
                 full_path = Path(file_path)
                 if not full_path.is_absolute():
-                    work_root = self._get_session_work_root()
-                    if work_root:
-                        full_path = Path(work_root) / file_path
+                    if self.work_root:
+                        full_path = self.work_root / file_path
 
                 if full_path.exists():
                     completed_items.append(f"File exists: {file_path}")
@@ -1247,14 +632,13 @@ class BaseTools(Tool):
     ) -> Dict[str, Any]:
         """Generate a patch file with all changes made during the session."""
         try:
-            work_root = self._get_session_work_root()
-            if not work_root:
+            if not self.work_root:
                 return {
                     "success": False,
-                    "error": "No work root set. Initialize workspace first."
+                    "error": "No work root set. Call base_tools__set_work_root first."
                 }
 
-            work_path = Path(work_root)
+            work_path = self.work_root
             if not work_path.exists():
                 return {
                     "success": False,

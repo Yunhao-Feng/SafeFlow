@@ -148,6 +148,7 @@ class PlanningTool(Tool):
                 "plan_file": str(plan_path),
                 "steps_count": len(steps),
                 "current_step": 1,
+                "plan_content": "\n".join([f"{i + 1}. {step}" for i, step in enumerate(steps)]),
                 "plan_summary": {
                     "task": task_description,
                     "goal": overall_goal,
