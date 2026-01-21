@@ -32,8 +32,7 @@ class DefaultAgent:
         self.trace_track = TraceTrack(root_dir=self.config.output_dir, agent_name=agent_name, item_id=item_id)
 
         # Initialize session state
-        self.session_initialized = False
-        self.initialization_attempted = False
+        self.plan_created = False
 
         # Test retry limitation to prevent infinite loops
         self.test_attempt_count = 0
@@ -47,6 +46,7 @@ class DefaultAgent:
         # Register all tools with same item_id
         self.tool_registry.register_tool(FileSystemTool(item_id=item_id))
         self.tool_registry.register_tool(WindowedEditorTool(item_id=item_id))
+        self.tool_registry.register_tool(PlanningTool(item_id=item_id))
 
         # Initialize BaseTools with work_root
         self.base_tools = BaseTools(item_id=item_id, work_root=work_root)
@@ -64,9 +64,6 @@ class DefaultAgent:
             item_id=item_id,
             default_agent_name=agent_name
         )
-
-        # Smart initialization state detection - check if we're already in a prepared environment
-        self._detect_and_set_initial_state()
 
         agent_console.print("✅ All Tools registered\n", style="green")
         agent_console.print(self.tool_registry.get_registry_summary())
@@ -112,60 +109,6 @@ class DefaultAgent:
 
 Start by understanding the problem and exploring the codebase."""
 
-    def _detect_and_set_initial_state(self) -> None:
-        """
-        Detect if we're already in a prepared environment and set initialization state accordingly.
-        This prevents redundant initialization when swe_run.py or other scripts have already prepared the environment.
-        """
-        try:
-            from pathlib import Path
-
-            # Check if work_root is already set and points to a valid directory
-            if self.work_root:
-                work_path = Path(self.work_root)
-                if work_path.exists() and work_path.is_dir():
-                    # Check if it's a git repository (strong indicator of prepared environment)
-                    git_dir = work_path / ".git"
-                    if git_dir.exists():
-                        # We're in a prepared repository environment
-                        self.session_initialized = True
-                        self.initialization_attempted = True  # Prevent initialization prompts
-
-                        # Mark base_tools as initialized too
-                        if self.base_tools:
-                            self.base_tools._mark_session_initialized(str(work_path))
-
-                        agent_console.print(f"🎯 Detected prepared repository environment at: {work_path}", style="cyan")
-                        return
-
-                    # Check if it contains typical project files (another indicator)
-                    project_indicators = [".git", "pyproject.toml", "setup.py", "package.json", "Makefile", "README.md"]
-                    found_indicators = [f for f in project_indicators if (work_path / f).exists()]
-
-                    if len(found_indicators) >= 2:  # Multiple project files suggest prepared environment
-                        self.session_initialized = True
-                        self.initialization_attempted = True
-
-                        # Mark base_tools as initialized
-                        if self.base_tools:
-                            self.base_tools._mark_session_initialized(str(work_path))
-
-                        agent_console.print(f"🎯 Detected prepared project environment at: {work_path} (found: {found_indicators})", style="cyan")
-                        return
-
-            # Check base_tools session state as fallback
-            if self.base_tools and hasattr(self.base_tools, '_is_session_initialized'):
-                if self.base_tools._is_session_initialized():
-                    self.session_initialized = True
-                    self.initialization_attempted = True
-                    agent_console.print("🎯 Detected existing session initialization", style="cyan")
-                    return
-
-            agent_console.print("🔧 No prepared environment detected, initialization will be required", style="yellow")
-        except Exception as e:
-            # If detection fails, err on the side of requiring initialization
-            agent_console.print(f"⚠️ Environment detection failed: {e}, will require initialization", style="yellow")
-
     def get_current_work_context(self) -> Dict[str, Any]:
         """Get current work context from context manager."""
         if self.context_manager:
@@ -173,10 +116,9 @@ Start by understanding the problem and exploring the codebase."""
 
         # Fallback: try to get from base_tools
         for tool_name, tool in self.tool_registry.tools.items():
-            if tool_name == "base_tools" and hasattr(tool, '_get_session_work_root'):
+            if tool_name == "base_tools" and hasattr(tool, 'get_current_work_root'):
                 return {
-                    "work_root": tool._get_session_work_root(),
-                    "initialized": tool._is_session_initialized() if hasattr(tool, '_is_session_initialized') else False,
+                    "work_root": str(tool.get_current_work_root()),
                     "message": "Context from base_tools (limited info)"
                 }
 
@@ -206,34 +148,6 @@ Start by understanding the problem and exploring the codebase."""
                 work_root = tool_result.get("result", {}).get("work_root")
                 if work_root:
                     self.context_manager.update_work_context(work_root=work_root)
-
-            elif function_name == "base_tools__complete_initialization" and tool_result.get("success"):
-                result = tool_result.get("result", {})
-                work_root = result.get("work_root")
-                task_analysis = result.get("task_analysis", {})
-
-                self.context_manager.update_work_context(
-                    work_root=work_root,
-                    initialization_status="completed"
-                )
-
-                # Track completed steps
-                for step in result.get("steps_completed", []):
-                    self.context_manager.add_completed_step(step)
-
-            # Also handle other initialization functions that complete initialization
-            elif "initialization_completed" in tool_result.get("result", {}):
-                result = tool_result.get("result", {})
-                work_root = result.get("work_root")
-
-                self.context_manager.update_work_context(
-                    work_root=work_root,
-                    initialization_status="completed"
-                )
-
-                # Track completed steps
-                for step in result.get("steps_completed", []):
-                    self.context_manager.add_completed_step(step)
 
         elif tool_name == "windowed_editor" or tool_name == "file_system":
             # Track file operations
@@ -275,75 +189,27 @@ Start by understanding the problem and exploring the codebase."""
                 return tool_name, fn
         raise ValueError(f"No tool found for function {fn}")
 
-    def _enhance_user_prompt_with_initialization(self, user_prompt: str) -> str:
+    def _enhance_user_prompt_with_planning(self, user_prompt: str) -> str:
         """
-        Enhance user prompt with initialization requirements if needed.
+        Enhance user prompt with planning requirements if needed.
         """
-        # Check if user is explicitly asking for reinitialization
-        reinit_keywords = ["reinitialize", "reset workspace", "start over", "force_reinit"]
-        if any(keyword in user_prompt.lower() for keyword in reinit_keywords):
-            self.session_initialized = False  # Reset state for forced reinit
-            self.initialization_attempted = False
-            return user_prompt  # Let user handle reinitialization themselves
-
-        # If already initialized at agent level, don't require initialization again
-        if self.session_initialized:
+        if self.plan_created:
             return user_prompt
 
-        # Check base_tools state as backup
-        base_tools = None
-        for tool_name, tool in self.tool_registry.tools.items():
-            if tool_name == "base_tools":
-                base_tools = tool
-                break
+        self.plan_created = True
+        return (
+            f"USER TASK: {user_prompt}\n\n"
+            "PLANNING REQUIREMENT: You must create a plan before starting work.\n"
+            "1. First call: planning_tool__create_plan() to break down the task into steps.\n"
+            "2. Then proceed with executing the plan step by step.\n\n"
+            "Remember: You MUST create a plan before starting work on the task."
+        )
 
-        if base_tools and hasattr(base_tools, '_is_session_initialized'):
-            if base_tools._is_session_initialized():
-                self.session_initialized = True  # Sync agent state
-                return user_prompt  # Already initialized
-
-        # Only enhance prompt if initialization hasn't been attempted yet
-        if not self.initialization_attempted:
-            self.initialization_attempted = True
-            return (
-                f"USER TASK: {user_prompt}\n\n"
-                "INITIALIZATION REQUIREMENT: You must initialize your workspace before proceeding.\n"
-                "1. First call: base_tools__check_initialization_status()\n"
-                "2. If not initialized, call: base_tools__complete_initialization(task_blob=\"" + user_prompt.replace('"', '\\"') + "\")\n"
-                "3. IMMEDIATELY after initialization, create a detailed plan using planning_tool__create_plan() to break down the task into steps\n"
-                "4. Then proceed with executing the plan step by step.\n\n"
-                "Remember: You MUST create a plan after initialization and before starting work on the task.")
-        else:
-            # Initialization was attempted but maybe not completed, just return original prompt
-            return user_prompt
-
-    def _check_initialization_completion(self, function_name: str, tool_result: Dict[str, Any]) -> None:
+    def _check_plan_creation(self, function_name: str, tool_result: Dict[str, Any]) -> None:
         """
-        Monitor tool calls to detect initialization completion and plan creation.
+        Monitor tool calls to detect plan creation.
         """
-        # Check if initialization-related functions completed successfully
-        if tool_result.get("success") and function_name in [
-            "base_tools__complete_initialization",
-            "base_tools__set_work_root"
-        ]:
-            # Mark as initialized if complete_initialization succeeded
-            if function_name == "base_tools__complete_initialization":
-                self.session_initialized = True
-                if self.context_manager:
-                    self.context_manager.record_memory(
-                        "milestone",
-                        "Workspace initialization completed successfully - plan creation required next"
-                    )
-
-            # Also mark as initialized if set_work_root succeeded (backup check)
-            elif function_name == "base_tools__set_work_root":
-                result_data = tool_result.get("result", {})
-                if result_data.get("session_initialized"):
-                    self.session_initialized = True
-
-
-        # Monitor plan creation
-        elif function_name == "planning_tool__create_plan" and tool_result.get("success"):
+        if function_name == "planning_tool__create_plan" and tool_result.get("success"):
             if self.context_manager:
                 # Extract plan content from result
                 plan_data = tool_result.get("result", {})
@@ -387,8 +253,8 @@ Start by understanding the problem and exploring the codebase."""
         enhanced_system_message = self.get_enhanced_system_message()
         push({"role": "system", "content": enhanced_system_message})
 
-        # 检查并引导初始化
-        enhanced_prompt = self._enhance_user_prompt_with_initialization(user_prompt)
+        # 检查并引导规划
+        enhanced_prompt = self._enhance_user_prompt_with_planning(user_prompt)
         push({"role": "user", "content": enhanced_prompt})
 
         # 保存工具schema到outputs目录便于调试和分析
@@ -404,7 +270,7 @@ Start by understanding the problem and exploring the codebase."""
                     reminder_msg = {"role": "system", "content": reminder_data["message"]}
                     push(reminder_msg)
 
-                # Add working directory reminder each turn (only after initialization)
+                # Add working directory reminder each turn
                 if self.context_manager and self.context_manager.should_remind_work_dir():
                     work_dir_reminder = self.context_manager.get_working_directory_reminder()
                     work_dir_msg = {"role": "system", "content": work_dir_reminder}
@@ -500,8 +366,8 @@ Start by understanding the problem and exploring the codebase."""
                 }
                 push(tool_msg)
 
-                # Monitor initialization completion
-                self._check_initialization_completion(function_name, tool_result)
+                # Monitor plan creation
+                self._check_plan_creation(function_name, tool_result)
 
                 # Monitor test attempts to prevent infinite loops
                 self._monitor_test_attempts(function_name, tool_result)
