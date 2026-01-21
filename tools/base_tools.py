@@ -151,7 +151,7 @@ class BaseTools(Tool):
         name: str = "base_tools",
         description: str = "Basic task management tools",
         command_timeout_sec: int = 300,
-        max_cmd_output_chars: int = 200_000,
+        max_cmd_output_chars: int = 1_000_000,
     ):
         super().__init__(name=name, description=description, category=ToolCategory.BASE_TOOLS)
         self.item_id = item_id
@@ -184,32 +184,6 @@ class BaseTools(Tool):
         """Get current work root as string for external access."""
         return str(self.work_root) if self.work_root else None
 
-    @tool_function(
-        description="Mark the current task as completed",
-        parameters=[
-            ToolParameter("message", "string", "Completion message describing what was accomplished", required=True),
-            ToolParameter("success", "boolean", "Whether the task was completed successfully", required=False)
-        ],
-        returns="Task completion status and details"
-    )
-    def finish_task(self, message: str, success: bool = True) -> Dict[str, Any]:
-        """Mark the current task as completed."""
-        try:
-            return {
-                "success": True,
-                "result": {
-                    "task_completed": True,
-                    "completion_success": success,
-                    "message": message,
-                    "work_root": str(self.work_root),
-                    "item_id": self.item_id
-                }
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
 
     @tool_function(
         description="Get the current working directory/root",
@@ -236,7 +210,7 @@ class BaseTools(Tool):
     def base_tools__initialize_context(
         self,
         task_blob: str,
-        preview_chars: int = 4000,
+        preview_chars: int = 40000,
         include_hidden: bool = False,
         max_entries: int = 50,
     ) -> Dict[str, Any]:

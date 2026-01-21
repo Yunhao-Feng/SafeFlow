@@ -26,6 +26,13 @@ from utils import load_config
 console = Console()
 
 
+def to_abs(path: str, base: str | None = None) -> str:
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    base_path = Path(base) if base else Path.cwd()
+    return str((base_path / p).resolve())
+
 class SWERunner:
     """Handles SWE-bench task execution workflow."""
 
@@ -344,31 +351,65 @@ def main():
     """Main entry point for SWE runner."""
     parser = argparse.ArgumentParser(description="Run SWE-bench tasks")
     parser.add_argument("--config", default="config/default.yaml", help="Agent configuration file")
-    parser.add_argument("--output-dir", default="/home/yunhao.fyh/project/Safeflow/swe_outputs", help="Output directory for results")
+    parser.add_argument("--output_dir", default="./swe_outputs", help="Output directory for results")
 
     args = parser.parse_args()
-
+    args.output_dir = to_abs(args.output_dir)
     # Load configuration
     config = load_config(args.config)
 
     # Load task data
     task_data = load_dataset("parquet", data_files={"test": config.parquet_path})
 
-    # Run SWE task
+    # Run SWE tasks (sequential)
     runner = SWERunner(args.output_dir)
-    results = runner.run_swe_task(task_data['test'][0], config)
 
-    # Print final results
+    all_results = []
+    success_cnt = 0
+
+    for i, row in enumerate(task_data["test"]):
+        results = runner.run_swe_task(row, config)
+        all_results.append(results)
+        if results.get("success"):
+            success_cnt += 1
+
+        # Print per-task final results
+        console.print(f"\n{'='*60}", style="bold blue")
+        console.print(f"FINAL RESULTS [{i+1}/{len(task_data['test'])}] - {results.get('instance_id')}", style="bold cyan")
+        console.print(f"{'='*60}", style="bold blue")
+        console.print(f"Success: {results.get('success')}", style="bold green" if results.get("success") else "bold red")
+        if "evaluation" in results:
+            eval_data = results["evaluation"]
+            console.print(
+                f"FAIL_TO_PASS: {eval_data['fail_to_pass']['success']}",
+                style="green" if eval_data["fail_to_pass"]["success"] else "red"
+            )
+            console.print(
+                f"PASS_TO_PASS: {eval_data['pass_to_pass']['success']}",
+                style="green" if eval_data["pass_to_pass"]["success"] else "red"
+            )
+
+    # Save global summary
+    summary = {
+        "total": len(all_results),
+        "success": success_cnt,
+        "failed": len(all_results) - success_cnt,
+        "results": all_results,
+    }
+    summary_path = Path(args.output_dir) / "summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
     console.print(f"\n{'='*60}", style="bold blue")
-    console.print("FINAL RESULTS", style="bold cyan")
+    console.print("ALL TASKS SUMMARY", style="bold cyan")
     console.print(f"{'='*60}", style="bold blue")
-    console.print(f"Success: {results['success']}", style="bold green" if results['success'] else "bold red")
-    if 'evaluation' in results:
-        eval_data = results['evaluation']
-        console.print(f"FAIL_TO_PASS: {eval_data['fail_to_pass']['success']}", style="green" if eval_data['fail_to_pass']['success'] else "red")
-        console.print(f"PASS_TO_PASS: {eval_data['pass_to_pass']['success']}", style="green" if eval_data['pass_to_pass']['success'] else "red")
+    console.print(f"Total: {summary['total']}")
+    console.print(f"Success: {summary['success']}", style="bold green" if summary["success"] else "bold")
+    console.print(f"Failed: {summary['failed']}", style="bold red" if summary["failed"] else "bold green")
+    console.print(f"Summary saved to: {summary_path}", style="blue")
 
-    return 0 if results['success'] else 1
+    return 0 if summary["failed"] == 0 else 1
 
 
 if __name__ == "__main__":
